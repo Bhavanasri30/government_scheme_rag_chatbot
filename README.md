@@ -2,7 +2,7 @@
 
 YojanaSetu is a Retrieval-Augmented Generation (RAG) chatbot that helps users discover relevant Indian government schemes and understand their preliminary eligibility, benefits, required documents and application process.
 
-The system searches a real dataset of 3,400 government schemes using semantic similarity and gives the retrieved information to the Gemini LLM through a strict grounding prompt. This reduces unsupported answers and keeps the response connected to the available scheme data.
+The system searches a real dataset of 3,400 government schemes using semantic similarity and gives the retrieved information to the Groq LLM through a strict grounding prompt. This reduces unsupported answers and keeps the response connected to the available scheme data.
 
 > **Important:** YojanaSetu provides preliminary guidance only. Users must verify current eligibility, deadlines and application information through the relevant official government portal.
 
@@ -46,7 +46,7 @@ The system:
 1. converts the user profile and question into an embedding;
 2. searches the FAISS index containing the scheme embeddings;
 3. retrieves the five most relevant scheme documents;
-4. sends only the retrieved information and user question to Gemini;
+4. sends only the retrieved information and user question to Groq;
 5. generates a structured, dataset-grounded response; and
 6. displays preliminary eligibility, matching conditions, missing information, benefits, documents and application steps.
 
@@ -56,7 +56,7 @@ The system:
 - User-profile-based preliminary eligibility guidance
 - Structured scheme recommendations
 - Benefits, documents and application-process explanation
-- Strict dataset-grounded Gemini prompt
+- Strict dataset-grounded Groq prompt
 - Suggested questions for students, farmers, women entrepreneurs and low-income families
 - New Chat functionality
 - Session-based chat history
@@ -76,8 +76,8 @@ The system:
 | Embedding model | `all-MiniLM-L6-v2` | Converts scheme text and user questions into 384-dimensional vectors |
 | Vector search | FAISS CPU | Stores and searches scheme embeddings using L2 distance |
 | Document storage | Python Pickle | Stores readable documents corresponding to FAISS vector positions |
-| Generative model | Gemini Flash | Generates the grounded, human-readable response |
-| Gemini SDK | Google GenAI | Connects the Python backend to the Gemini API |
+| Generative model | Groq | Generates the grounded, human-readable response |
+| Groq SDK | Groq Python SDK | Connects the Python backend to the Groq API |
 | Secret configuration | Python Dotenv | Loads local environment variables from `.env` |
 | Frontend | Streamlit | Provides the chatbot interface |
 | State management | Streamlit Session State | Maintains profile and chat history during a session |
@@ -197,7 +197,7 @@ flowchart TD
     E["User profile and question"] --> F["Question embedding"]
     F --> D
     D --> G["Top five schemes"]
-    G --> H["Grounded Gemini prompt"]
+    G --> H["Grounded Groq prompt"]
     E --> H
     H --> I["Preliminary eligibility answer"]
     I --> J["Streamlit chatbot"]
@@ -213,18 +213,18 @@ flowchart TD
 6. FAISS returns the positions and distances of the five nearest vectors.
 7. The positions are used to retrieve complete scheme text from `scheme_documents.pkl`.
 8. The question and retrieved schemes are placed in a strict grounding prompt.
-9. Gemini Flash generates a structured preliminary eligibility response.
+9. Groq generates a structured preliminary eligibility response.
 10. Streamlit displays the answer and stores it in session-based chat history.
 
 The core relationship is:
 
 ```text
-MiniLM converts → FAISS finds → Pickle provides → Gemini explains → Streamlit displays
+MiniLM converts → FAISS finds → Pickle provides → Groq explains → Streamlit displays
 ```
 
 ## Grounding and Hallucination Control
 
-The Gemini prompt instructs the model to:
+The Groq prompt instructs the model to:
 
 - use only the retrieved scheme information;
 - not invent schemes, eligibility conditions or benefits;
@@ -309,18 +309,18 @@ pandas
 numpy
 faiss-cpu
 sentence-transformers
-google-genai
+groq
 python-dotenv
 streamlit
 ```
 
-### 4. Configure the Gemini API key
+### 4. Configure the Groq API key
 
 Create a `.env` file in the project root:
 
 ```env
-GEMINI_API_KEY=your_gemini_api_key
-GEMINI_MODEL=gemini-3.6-flash
+GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=your_configured_groq_model
 RAG_TOP_K=5
 ```
 
@@ -380,8 +380,8 @@ Adding age, state, category, occupation, education and annual family income gene
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `GEMINI_API_KEY` | Yes | None | Authenticates Gemini API requests |
-| `GEMINI_MODEL` | No | `gemini-3.6-flash` | Selects the Gemini model |
+| `GROQ_API_KEY` | Yes | None | Authenticates Groq API requests |
+| `GROQ_MODEL` | No | Project default | Selects the configured Groq model |
 | `RAG_TOP_K` | No | `5` | Controls how many schemes are retrieved |
 | `EMBEDDING_MODEL` | No | `all-MiniLM-L6-v2` | Selects the query embedding model |
 | `FAISS_INDEX_PATH` | No | Auto-detected | Overrides the FAISS index path |
@@ -419,7 +419,7 @@ If an API key is accidentally committed or shown publicly, revoke it and generat
 
 ## Future Enhancements
 
-- Permanent chat history using SQLite or MongoDB
+- Permanent chat history using PostgreSQL
 - User authentication and saved profiles
 - Telugu, Hindi and other Indian-language support
 - Voice input and text-to-speech output

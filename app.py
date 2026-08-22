@@ -1,10 +1,18 @@
 import logging
+import os
 import re
+from datetime import datetime, timezone
 from uuid import uuid4
 
+import psycopg
 import streamlit as st
+from psycopg.types.json import Jsonb
 
-from rag import ask_schemesathi
+from rag import (
+    ERROR_MESSAGE,
+    normalize_status,
+    ask_schemesathi,
+)
 
 # ---------------------------------------------------------------------------
 # Page config MUST be the first Streamlit command in the script.
@@ -39,6 +47,188 @@ PROFILE_DEFAULTS = {
     "annual_income": "",
 }
 
+# ---------------------------------------------------------------------------
+# PostgreSQL helpers
+# ---------------------------------------------------------------------------
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def database_url():
+    """Read the PostgreSQL URL from Streamlit secrets or the environment."""
+    url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+    if url:
+        return url
+    try:
+        url = st.secrets.get("DATABASE_URL") or st.secrets.get("POSTGRES_URL")
+    except (FileNotFoundError, KeyError):
+        url = None
+    return url
+
+
+@st.cache_resource(show_spinner=False)
+def initialize_database():
+    url = database_url()
+    if not url:
+        LOGGER.warning("DATABASE_URL is not configured; using session-only storage")
+        return False
+    try:
+        with psycopg.connect(url, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS yojanasetu_sessions (
+                        session_id TEXT PRIMARY KEY,
+                        profile JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS yojanasetu_chats (
+                        session_id TEXT NOT NULL,
+                        chat_id TEXT NOT NULL,
+                        title TEXT NOT NULL DEFAULT 'New conversation',
+                        messages JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (session_id, chat_id)
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_yojanasetu_chats_updated
+                    ON yojanasetu_chats (session_id, updated_at DESC)
+                    """
+                )
+        return True
+    except psycopg.Error:
+        LOGGER.exception("Could not connect to PostgreSQL")
+        return False
+
+
+def open_database():
+    if not initialize_database():
+        return None
+    try:
+        return psycopg.connect(database_url(), connect_timeout=5)
+    except psycopg.Error:
+        LOGGER.exception("Could not open a PostgreSQL connection")
+        return None
+
+
+def save_chat(chat_id):
+    if chat_id not in st.session_state.chats:
+        return
+    connection = open_database()
+    if connection is None:
+        return
+    chat = st.session_state.chats[chat_id]
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO yojanasetu_chats
+                        (session_id, chat_id, title, messages, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (session_id, chat_id) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        messages = EXCLUDED.messages,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        st.session_state.session_id,
+                        chat_id,
+                        chat["title"],
+                        Jsonb(chat["messages"]),
+                        utc_now(),
+                        utc_now(),
+                    ),
+                )
+    except psycopg.Error:
+        LOGGER.exception("Could not save chat %s", chat_id)
+    finally:
+        connection.close()
+
+
+def save_profile():
+    connection = open_database()
+    if connection is None:
+        return
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO yojanasetu_sessions
+                        (session_id, profile, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (session_id) DO UPDATE SET
+                        profile = EXCLUDED.profile,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        st.session_state.session_id,
+                        Jsonb(st.session_state.profile_data),
+                        utc_now(),
+                        utc_now(),
+                    ),
+                )
+    except psycopg.Error:
+        LOGGER.exception("Could not save the user profile")
+    finally:
+        connection.close()
+
+
+def load_saved_data():
+    connection = open_database()
+    if connection is None:
+        return {}, PROFILE_DEFAULTS.copy()
+    try:
+        chats = {}
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT chat_id, title, messages
+                FROM yojanasetu_chats
+                WHERE session_id = %s
+                ORDER BY created_at ASC
+                """,
+                (st.session_state.session_id,),
+            )
+            for chat_id, title, messages in cursor.fetchall():
+                normalized_messages = []
+                for message in messages or []:
+                    if message.get("role") == "assistant":
+                        message = dict(message)
+                        message["status"] = normalize_status(
+                            message.get("status", message.get("response_status"))
+                        )
+                        message.pop("response_status", None)
+                    normalized_messages.append(message)
+                chats[chat_id] = {
+                    "title": title or "New conversation",
+                    "messages": normalized_messages,
+                }
+            cursor.execute(
+                "SELECT profile FROM yojanasetu_sessions WHERE session_id = %s",
+                (st.session_state.session_id,),
+            )
+            session = cursor.fetchone()
+        profile = PROFILE_DEFAULTS.copy()
+        if session:
+            profile.update(session[0] or {})
+        return chats, profile
+    except psycopg.Error:
+        LOGGER.exception("Could not load saved PostgreSQL data")
+        return {}, PROFILE_DEFAULTS.copy()
+    finally:
+        connection.close()
+
 
 # ---------------------------------------------------------------------------
 # Session-state helpers
@@ -47,6 +237,7 @@ def create_chat():
     chat_id = uuid4().hex
     st.session_state.chats[chat_id] = {"title": "New conversation", "messages": []}
     st.session_state.active_chat_id = chat_id
+    save_chat(chat_id)
     return chat_id
 
 
@@ -55,11 +246,45 @@ def active_chat():
 
 
 def delete_chat(chat_id):
+    connection = open_database()
+    if connection is not None:
+        try:
+            with connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        DELETE FROM yojanasetu_chats
+                        WHERE session_id = %s AND chat_id = %s
+                        """,
+                        (st.session_state.session_id, chat_id),
+                    )
+        except psycopg.Error:
+            LOGGER.exception("Could not delete chat %s", chat_id)
+        finally:
+            connection.close()
     st.session_state.chats.pop(chat_id, None)
     if not st.session_state.chats:
         create_chat()
     elif st.session_state.active_chat_id == chat_id:
         st.session_state.active_chat_id = next(iter(st.session_state.chats))
+
+
+def clear_all_chats():
+    connection = open_database()
+    if connection is not None:
+        try:
+            with connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM yojanasetu_chats WHERE session_id = %s",
+                        (st.session_state.session_id,),
+                    )
+        except psycopg.Error:
+            LOGGER.exception("Could not clear saved chats")
+        finally:
+            connection.close()
+    st.session_state.chats = {}
+    create_chat()
 
 
 def title_from_question(question):
@@ -94,17 +319,57 @@ def submit_question(question):
     if len([m for m in chat["messages"] if m["role"] == "user"]) == 1:
         chat["title"] = title_from_question(question)
 
+    previous_assistant = next(
+        (
+            message for message in reversed(chat["messages"][:-1])
+            if message.get("role") == "assistant"
+        ),
+        None,
+    )
+    previous_user = None
+    if previous_assistant:
+        assistant_index = chat["messages"].index(previous_assistant)
+        previous_user = next(
+            (
+                message for message in reversed(chat["messages"][:assistant_index])
+                if message.get("role") == "user"
+            ),
+            None,
+        )
+
     with st.spinner("Searching the government scheme knowledge base..."):
         try:
-            answer = ask_schemesathi(build_complete_question(question))
+            answer, response_status = ask_schemesathi(
+                question,
+                conversation_context={
+                    "previous_user_question": (
+                        previous_user.get("content", "") if previous_user else ""
+                    ),
+                    "previous_assistant_answer": (
+                        previous_assistant.get("content", "")
+                        if previous_assistant else ""
+                    ),
+                },
+                previous_status=normalize_status(
+                    previous_assistant.get("status") if previous_assistant else None
+                ),
+                latest_user_question=question,
+                return_status=True,
+                profile_context=build_complete_question(question),
+            )
         except Exception:
             LOGGER.exception("SchemeSathi backend request failed")
-            answer = (
-                "I could not search the scheme knowledge base right now. "
-                "Please wait a moment and try again."
-            )
+            answer = ERROR_MESSAGE
+            response_status = "error"
 
-    chat["messages"].append({"role": "assistant", "content": answer})
+    chat["messages"].append(
+        {
+            "role": "assistant",
+            "content": answer,
+            "status": normalize_status(response_status),
+        }
+    )
+    save_chat(st.session_state.active_chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +403,7 @@ def render_profile():
         profile["annual_income"] = st.text_input(
             "Annual family income", key="profile_income", placeholder="e.g. 200000"
         )
+        save_profile()
 
 
 def render_sidebar():
@@ -188,8 +454,7 @@ def render_sidebar():
                         use_container_width=True,
                         type="primary",
                     ):
-                        st.session_state.chats = {}
-                        create_chat()
+                        clear_all_chats()
                         st.session_state.confirm_clear = False
                         st.rerun()
                 with cancel_col:
@@ -203,10 +468,17 @@ def render_sidebar():
 # ---------------------------------------------------------------------------
 # Session-state initialisation
 # ---------------------------------------------------------------------------
+if "session_id" not in st.session_state:
+    existing_session_id = st.query_params.get("session")
+    st.session_state.session_id = existing_session_id or uuid4().hex
+    st.query_params["session"] = st.session_state.session_id
 if "chats" not in st.session_state:
-    st.session_state.chats = {}
+    saved_chats, saved_profile = load_saved_data()
+    st.session_state.chats = saved_chats
+else:
+    saved_profile = PROFILE_DEFAULTS.copy()
 if "profile_data" not in st.session_state:
-    st.session_state.profile_data = PROFILE_DEFAULTS.copy()
+    st.session_state.profile_data = saved_profile
 for key, value in PROFILE_DEFAULTS.items():
     st.session_state.profile_data.setdefault(key, value)
 for profile_key, widget_key in {
